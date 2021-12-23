@@ -1,10 +1,11 @@
-use clap::{
-    crate_description, crate_name, crate_version, value_t, App, AppSettings, Arg, SubCommand,
-};
+use std::borrow::Borrow;
+use clap::{crate_description, crate_name, crate_version, value_t, App, AppSettings, Arg, SubCommand, value_t_or_exit};
 use solana_clap_utils::{
     input_parsers::{keypair_of, pubkey_of, value_of, values_of},
     input_validators::{is_amount, is_keypair, is_parsable, is_pubkey, is_slot, is_url},
 };
+use solana_clap_utils::input_validators::is_valid_signer;
+use solana_clap_utils::keypair::signer_from_path;
 use solana_client::rpc_client::RpcClient;
 use solana_program::{msg, program_pack::Pack, pubkey::Pubkey, system_program, sysvar};
 use solana_sdk::{self, signature::Keypair, signature::Signer, transaction::Transaction};
@@ -19,8 +20,8 @@ use token_vesting::{
 fn command_create_svc(
     rpc_client: RpcClient,
     program_id: Pubkey,
-    payer: Keypair,
-    source_token_owner: Keypair,
+    payer: Box<dyn Signer>,
+    source_token_owner: Box<dyn Signer>,
     possible_source_token_pubkey: Option<Pubkey>,
     destination_token_pubkey: Pubkey,
     mint_address: Pubkey,
@@ -60,7 +61,7 @@ fn command_create_svc(
             vesting_seed,
             schedules.len() as u32,
         )
-        .unwrap(),
+            .unwrap(),
         create_associated_token_account(
             &source_token_owner.pubkey(),
             &vesting_pubkey,
@@ -78,13 +79,13 @@ fn command_create_svc(
             schedules,
             vesting_seed,
         )
-        .unwrap(),
+            .unwrap(),
     ];
 
     let mut transaction = Transaction::new_with_payer(&instructions, Some(&payer.pubkey()));
 
-    let recent_blockhash = rpc_client.get_recent_blockhash().unwrap().0;
-    transaction.sign(&[&payer], recent_blockhash);
+    let recent_blockhash = rpc_client.get_latest_blockhash().unwrap();
+    transaction.sign(&[payer.as_ref()], recent_blockhash);
 
     rpc_client.send_transaction(&transaction).unwrap();
 
@@ -99,7 +100,7 @@ fn command_unlock_svc(
     rpc_client: RpcClient,
     program_id: Pubkey,
     vesting_seed: [u8; 32],
-    payer: Keypair,
+    payer: Box<dyn Signer>,
 ) {
     // Find the non reversible public key for the vesting contract via the seed
     let (vesting_pubkey, _) = Pubkey::find_program_address(&[&vesting_seed[..31]], &program_id);
@@ -121,12 +122,12 @@ fn command_unlock_svc(
         &destination_token_pubkey,
         vesting_seed,
     )
-    .unwrap();
+        .unwrap();
 
     let mut transaction = Transaction::new_with_payer(&[unlock_instruction], Some(&payer.pubkey()));
 
-    let recent_blockhash = rpc_client.get_recent_blockhash().unwrap().0;
-    transaction.sign(&[&payer], recent_blockhash);
+    let recent_blockhash = rpc_client.get_latest_blockhash().unwrap();
+    transaction.sign(&[payer.as_ref()], recent_blockhash);
 
     rpc_client.send_transaction(&transaction).unwrap();
 }
@@ -164,7 +165,7 @@ fn command_change_destination(
         &new_destination_token_account,
         vesting_seed,
     )
-    .unwrap();
+        .unwrap();
 
     let mut transaction = Transaction::new_with_payer(&[unlock_instruction], Some(&payer.pubkey()));
 
@@ -248,7 +249,7 @@ fn main() {
                     "Specify the address (public key) of the program.",
                 ),
         )
-        .subcommand(SubCommand::with_name("create").about("Create a new vesting contract with an optionnal release schedule")        
+        .subcommand(SubCommand::with_name("create").about("Create a new vesting contract with an optionnal release schedule")
             .arg(
                 Arg::with_name("mint_address")
                     .long("mint_address")
@@ -263,7 +264,7 @@ fn main() {
                 Arg::with_name("source_owner")
                     .long("source_owner")
                     .value_name("KEYPAIR")
-                    .validator(is_keypair)
+                    .validator(is_valid_signer)
                     .takes_value(true)
                     .help(
                         "Specify the source account owner. \
@@ -343,7 +344,7 @@ fn main() {
                 Arg::with_name("payer")
                     .long("payer")
                     .value_name("KEYPAIR")
-                    .validator(is_keypair)
+                    .validator(is_valid_signer)
                     .takes_value(true)
                     .help(
                         "Specify the transaction fee payer account address. \
@@ -368,7 +369,7 @@ fn main() {
                 Arg::with_name("payer")
                     .long("payer")
                     .value_name("KEYPAIR")
-                    .validator(is_keypair)
+                    .validator(is_valid_signer)
                     .takes_value(true)
                     .help(
                         "Specify the transaction fee payer account address. \
@@ -428,7 +429,7 @@ fn main() {
                 Arg::with_name("payer")
                     .long("payer")
                     .value_name("KEYPAIR")
-                    .validator(is_keypair)
+                    .validator(is_valid_signer)
                     .takes_value(true)
                     .help(
                         "Specify the transaction fee payer account address. \
@@ -450,14 +451,23 @@ fn main() {
             )
         )
         .get_matches();
-
+    let mut wallet_manager = None;
     let rpc_url = value_t!(matches, "rpc_url", String).unwrap();
     let rpc_client = RpcClient::new(rpc_url);
     let program_id = pubkey_of(&matches, "program_id").unwrap();
 
     let _ = match matches.subcommand() {
         ("create", Some(arg_matches)) => {
-            let source_keypair = keypair_of(arg_matches, "source_owner").unwrap();
+            println!("create with args payer = {}", arg_matches.value_of("payer").unwrap()); //TODO remove debug log
+            let source_keypair_str = value_t_or_exit!(arg_matches, "source_owner", String);
+            let source_keypair = signer_from_path(
+                arg_matches,
+                &source_keypair_str,
+                "source_owner",
+                &mut wallet_manager,
+            ).unwrap();
+            println!("create with source token {}", source_keypair.pubkey());
+
             let source_token_pubkey = pubkey_of(arg_matches, "source_token_address");
             let mint_address = pubkey_of(arg_matches, "mint_address").unwrap();
             let destination_pubkey = match pubkey_of(arg_matches, "destination_token_address") {
@@ -467,7 +477,16 @@ fn main() {
                 ),
                 Some(destination_token_pubkey) => destination_token_pubkey,
             };
-            let payer_keypair = keypair_of(arg_matches, "payer").unwrap();
+
+            let keypair_str = value_t_or_exit!(arg_matches, "payer", String);
+            let payer_keypair = signer_from_path(
+                arg_matches,
+                &keypair_str,
+                "payer",
+                &mut wallet_manager,
+            ).unwrap();
+            println!("create with signer {}", payer_keypair.pubkey());
+
 
             // Parsing schedules
             let schedule_amounts: Vec<u64> = values_of(arg_matches, "amounts").unwrap();
@@ -496,9 +515,17 @@ fn main() {
             )
         }
         ("unlock", Some(arg_matches)) => {
+            println!("Unlock with args {}", arg_matches.value_of("payer").unwrap());
             // The seed is given in the format of a pubkey on the user side but it's handled as a [u8;32] in the program
             let vesting_seed = pubkey_of(arg_matches, "seed").unwrap().to_bytes();
-            let payer_keypair = keypair_of(arg_matches, "payer").unwrap();
+            let keypair_str = value_t_or_exit!(arg_matches, "payer", String);
+            let payer_keypair = signer_from_path(
+                arg_matches,
+                &keypair_str,
+                "payer",
+                &mut wallet_manager,
+            ).unwrap();
+            println!("Unlock with signer {}", payer_keypair.pubkey());
             command_unlock_svc(rpc_client, program_id, vesting_seed, payer_keypair)
         }
         ("change-destination", Some(arg_matches)) => {
