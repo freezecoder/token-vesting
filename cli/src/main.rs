@@ -87,7 +87,7 @@ fn command_create_svc(
     let recent_blockhash = rpc_client.get_latest_blockhash().unwrap();
     transaction.sign(&[payer.as_ref()], recent_blockhash);
 
-    rpc_client.send_transaction(&transaction).unwrap();
+    rpc_client.send_and_confirm_transaction_with_spinner(&transaction).unwrap();
 
     msg!(
         "\nThe seed of the contract is: {:?}",
@@ -129,7 +129,7 @@ fn command_unlock_svc(
     let recent_blockhash = rpc_client.get_latest_blockhash().unwrap();
     transaction.sign(&[payer.as_ref()], recent_blockhash);
 
-    rpc_client.send_transaction(&transaction).unwrap();
+    rpc_client.send_and_confirm_transaction_with_spinner(&transaction).unwrap();
 }
 
 fn command_change_destination(
@@ -175,7 +175,7 @@ fn command_change_destination(
         recent_blockhash,
     );
 
-    rpc_client.send_transaction(&transaction).unwrap();
+    rpc_client.send_and_confirm_transaction_with_spinner(&transaction).unwrap();
 }
 
 fn command_info(
@@ -458,7 +458,6 @@ fn main() {
 
     let _ = match matches.subcommand() {
         ("create", Some(arg_matches)) => {
-            println!("create with args payer = {}", arg_matches.value_of("payer").unwrap()); //TODO remove debug log
             let source_keypair_str = value_t_or_exit!(arg_matches, "source_owner", String);
             let source_keypair = signer_from_path(
                 arg_matches,
@@ -466,7 +465,6 @@ fn main() {
                 "source_owner",
                 &mut wallet_manager,
             ).unwrap();
-            println!("create with source token {}", source_keypair.pubkey());
 
             let source_token_pubkey = pubkey_of(arg_matches, "source_token_address");
             let mint_address = pubkey_of(arg_matches, "mint_address").unwrap();
@@ -485,8 +483,6 @@ fn main() {
                 "payer",
                 &mut wallet_manager,
             ).unwrap();
-            println!("create with signer {}", payer_keypair.pubkey());
-
 
             // Parsing schedules
             let schedule_amounts: Vec<u64> = values_of(arg_matches, "amounts").unwrap();
@@ -515,7 +511,6 @@ fn main() {
             )
         }
         ("unlock", Some(arg_matches)) => {
-            println!("Unlock with args {}", arg_matches.value_of("payer").unwrap());
             // The seed is given in the format of a pubkey on the user side but it's handled as a [u8;32] in the program
             let vesting_seed = pubkey_of(arg_matches, "seed").unwrap().to_bytes();
             let keypair_str = value_t_or_exit!(arg_matches, "payer", String);
@@ -525,7 +520,6 @@ fn main() {
                 "payer",
                 &mut wallet_manager,
             ).unwrap();
-            println!("Unlock with signer {}", payer_keypair.pubkey());
             command_unlock_svc(rpc_client, program_id, vesting_seed, payer_keypair)
         }
         ("change-destination", Some(arg_matches)) => {
