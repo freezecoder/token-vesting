@@ -1,11 +1,12 @@
-use std::borrow::Borrow;
-use clap::{crate_description, crate_name, crate_version, value_t, App, AppSettings, Arg, SubCommand, value_t_or_exit};
+use clap::{
+    crate_description, crate_name, crate_version, value_t, value_t_or_exit,
+    App, AppSettings, Arg, SubCommand,
+};
 use solana_clap_utils::{
     input_parsers::{keypair_of, pubkey_of, value_of, values_of},
-    input_validators::{is_amount, is_keypair, is_parsable, is_pubkey, is_slot, is_url},
+    input_validators::{is_amount, is_keypair, is_parsable, is_pubkey, is_slot, is_url, is_valid_signer},
+    keypair::signer_from_path,
 };
-use solana_clap_utils::input_validators::is_valid_signer;
-use solana_clap_utils::keypair::signer_from_path;
 use solana_client::rpc_client::RpcClient;
 use solana_program::{msg, program_pack::Pack, pubkey::Pubkey, system_program, sysvar};
 use solana_sdk::{self, signature::Keypair, signature::Signer, transaction::Transaction};
@@ -84,8 +85,8 @@ fn command_create_svc(
 
     let mut transaction = Transaction::new_with_payer(&instructions, Some(&payer.pubkey()));
 
-    let recent_blockhash = rpc_client.get_latest_blockhash().unwrap();
-    transaction.sign(&[payer.as_ref()], recent_blockhash);
+    let latest_blockhash = rpc_client.get_latest_blockhash().unwrap();
+    transaction.sign(&[payer.as_ref()], latest_blockhash);
 
     rpc_client.send_and_confirm_transaction_with_spinner(&transaction).unwrap();
 
@@ -95,6 +96,96 @@ fn command_create_svc(
     );
     msg!("Please write it down as it is needed to interact with the contract.");
 }
+
+// Lock multiple vesting contracts
+fn command_create_multiple_svc(
+    rpc_client: RpcClient,
+    program_id: Pubkey,
+    payer: Box<dyn Signer>,
+    source_token_owner: Box<dyn Signer>,
+    possible_source_token_pubkey: Option<Pubkey>,
+    destinations: Vec<(Pubkey, Vec<Schedule>)>,
+    mint_address: Pubkey,
+) {
+    let mut instructions = vec![];
+    // If no source token account was given, use the associated source account
+    let source_token_pubkey = match possible_source_token_pubkey {
+        None => get_associated_token_address(&source_token_owner.pubkey(), &mint_address),
+        _ => possible_source_token_pubkey.unwrap(),
+    };
+
+    for (destination_address, schedules) in destinations {
+        let destination_token_pubkey = get_associated_token_address(&destination_address, &mint_address);
+
+        // Find a valid seed for the vesting program account key to be non reversible and unused
+        let mut not_found = true;
+        let mut vesting_seed: [u8; 32] = [0; 32];
+        let mut vesting_pubkey = Pubkey::new_unique();
+        while not_found {
+            vesting_seed = Pubkey::new_unique().to_bytes();
+            let program_id_bump = Pubkey::find_program_address(&[&vesting_seed[..31]], &program_id);
+            vesting_pubkey = program_id_bump.0;
+            vesting_seed[31] = program_id_bump.1;
+            not_found = match rpc_client.get_account(&vesting_pubkey) {
+                Ok(_) => true,
+                Err(_) => false,
+            }
+        }
+
+        let vesting_token_pubkey = get_associated_token_address(&vesting_pubkey, &mint_address);
+
+        msg!("\nVesting seeds are:");
+
+        // Create and initiliaze the vesting token account
+        instructions.push(
+            init(
+                &system_program::id(),
+                &sysvar::rent::id(),
+                &program_id,
+                &payer.pubkey(),
+                &vesting_pubkey,
+                vesting_seed,
+                schedules.len() as u32,
+            )
+                .unwrap()
+        );
+        instructions.push(
+            create_associated_token_account(
+                &source_token_owner.pubkey(),
+                &vesting_pubkey,
+                &mint_address,
+            ),
+        );
+        instructions.push(
+            create(
+                &program_id,
+                &spl_token::id(),
+                &vesting_pubkey,
+                &vesting_token_pubkey,
+                &source_token_owner.pubkey(),
+                &source_token_pubkey,
+                &destination_token_pubkey,
+                &mint_address,
+                schedules.to_vec(),
+                vesting_seed,
+            )
+                .unwrap()
+        );
+        msg!(
+            "\n{:?}",
+            Pubkey::new_from_array(vesting_seed)
+        );
+    }
+    msg!("Please write them down as they are needed to interact with the contract.");
+
+    let mut transaction = Transaction::new_with_payer(&instructions, Some(&payer.pubkey()));
+
+    let latest_blockhash = rpc_client.get_latest_blockhash().unwrap();
+    transaction.sign(&[payer.as_ref()], latest_blockhash);
+
+    rpc_client.send_and_confirm_transaction_with_spinner(&transaction).unwrap();
+}
+
 
 fn command_unlock_svc(
     rpc_client: RpcClient,
@@ -126,8 +217,8 @@ fn command_unlock_svc(
 
     let mut transaction = Transaction::new_with_payer(&[unlock_instruction], Some(&payer.pubkey()));
 
-    let recent_blockhash = rpc_client.get_latest_blockhash().unwrap();
-    transaction.sign(&[payer.as_ref()], recent_blockhash);
+    let latest_blockhash = rpc_client.get_latest_blockhash().unwrap();
+    transaction.sign(&[payer.as_ref()], latest_blockhash);
 
     rpc_client.send_and_confirm_transaction_with_spinner(&transaction).unwrap();
 }
@@ -169,12 +260,10 @@ fn command_change_destination(
 
     let mut transaction = Transaction::new_with_payer(&[unlock_instruction], Some(&payer.pubkey()));
 
-    let recent_blockhash = rpc_client.get_recent_blockhash().unwrap().0;
+    let latest_blockhash = rpc_client.get_latest_blockhash().unwrap();
     transaction.sign(
         &[&payer, &destination_token_account_owner],
-        recent_blockhash,
-    );
-
+        latest_blockhash);
     rpc_client.send_and_confirm_transaction_with_spinner(&transaction).unwrap();
 }
 
@@ -263,12 +352,12 @@ fn main() {
             .arg(
                 Arg::with_name("source_owner")
                     .long("source_owner")
-                    .value_name("KEYPAIR")
+                    .value_name("SIGNER")
                     .validator(is_valid_signer)
                     .takes_value(true)
                     .help(
                         "Specify the source account owner. \
-                        This may be a keypair file, the ASK keyword. \
+                        This may be a keypair file, the ASK keyword, or an URL to a Ledger keypair. \
                         Defaults to the client keypair.",
                     ),
             )
@@ -343,12 +432,85 @@ fn main() {
             .arg(
                 Arg::with_name("payer")
                     .long("payer")
-                    .value_name("KEYPAIR")
+                    .value_name("SIGNER")
                     .validator(is_valid_signer)
                     .takes_value(true)
                     .help(
                         "Specify the transaction fee payer account address. \
-                        This may be a keypair file, the ASK keyword. \
+                        This may be a keypair file, the ASK keyword, or an URL to a Ledger keypair. \
+                        Defaults to the client keypair.",
+                    ),
+            )
+        )
+        .subcommand(SubCommand::with_name("create-multi")
+            .about("Create multiple vesting contracts with a common release schedule")
+            .arg(
+                Arg::with_name("vestings")
+                    .multiple(true)
+                    .value_name("ADDRESS:amount1,amount2,...,amountN")
+                    .takes_value(true)
+                    .index(1)
+                    .required(true)
+                    .help("Multiple investor addresses combined with release times")
+            )
+            .arg(
+                Arg::with_name("mint_address")
+                    .long("mint_address")
+                    .value_name("ADDRESS")
+                    .validator(is_pubkey)
+                    .takes_value(true)
+                    .help(
+                        "Specify the address (publickey) of the mint for the token that should be used.",
+                    ),
+            )
+            .arg(
+                Arg::with_name("source_owner")
+                    .long("source_owner")
+                    .value_name("SIGNER")
+                    .validator(is_valid_signer)
+                    .takes_value(true)
+                    .help(
+                        "Specify the source account owner. \
+                        This may be a keypair file, the ASK keyword, or an URL to a Ledger keypair. \
+                        Defaults to the client keypair.",
+                    ),
+            )
+            .arg(
+                Arg::with_name("source_token_address")
+                    .long("source_token_address")
+                    .value_name("ADDRESS")
+                    .validator(is_pubkey)
+                    .takes_value(true)
+                    .help(
+                        "Specify the source token account address.",
+                    ),
+            )
+            .arg(
+                Arg::with_name("release-times")
+                    .long("release-times")
+                    .value_name("SLOT")
+                    .validator(is_slot)
+                    .takes_value(true)
+                    .multiple(true)
+                    .use_delimiter(true)
+                    .value_terminator("!")
+                    .allow_hyphen_values(true)
+                    .help(
+                        "Release times in unix timestamp to decide when the contract is \
+                        unlockable. Multiple inputs seperated by a comma are
+                        accepted for the creation of multiple schedules. The sequence of inputs \
+                        needs to end with an exclamation mark ( e.g. 1,2,3,! ).",
+                    ),
+            )
+            .arg(
+                Arg::with_name("payer")
+                    .long("payer")
+                    .value_name("SIGNER")
+                    .validator(is_valid_signer)
+                    .takes_value(true)
+                    .help(
+                        "Specify the transaction fee payer account address. \
+                        This may be a keypair file, the ASK keyword, or an URL to a Ledger keypair. \
                         Defaults to the client keypair.",
                     ),
             )
@@ -373,7 +535,7 @@ fn main() {
                     .takes_value(true)
                     .help(
                         "Specify the transaction fee payer account address. \
-                        This may be a keypair file, the ASK keyword. \
+                        This may be a keypair file, the ASK keyword, or an URL to a Ledger keypair. \
                         Defaults to the client keypair.",
                     ),
             )
@@ -508,6 +670,55 @@ fn main() {
                 destination_pubkey,
                 mint_address,
                 schedules,
+            )
+        }
+        ("create-multi", Some(arg_matches)) => {
+            let source_keypair_str = value_t_or_exit!(arg_matches, "source_owner", String);
+            let source_keypair = signer_from_path(
+                arg_matches,
+                &source_keypair_str,
+                "source_owner",
+                &mut wallet_manager,
+            ).unwrap();
+            let source_token_pubkey = pubkey_of(arg_matches, "source_token_address");
+            let mint_address = pubkey_of(arg_matches, "mint_address").unwrap();
+            let keypair_str = value_t_or_exit!(arg_matches, "payer", String);
+            let payer_keypair = signer_from_path(
+                arg_matches,
+                &keypair_str,
+                "payer",
+                &mut wallet_manager,
+            ).unwrap();
+
+            // Parsing schedules
+            let schedule_times: Vec<u64> = values_of(arg_matches, "release-times").unwrap();
+            let vestings_str: Vec<String> = values_of(arg_matches, "vestings").unwrap();
+            let vestings = vestings_str.iter().map(|vesting_str| {
+                let v: Vec<_> = vesting_str.split(':').collect();
+                let (address, amounts_str) = match v[..] {
+                    [address, amounts_str] => (address, amounts_str),
+                    _ => panic!("bad vesting"),
+                };
+                let amounts_strs: Vec<_> = amounts_str.split(',').collect();
+                let amounts: Vec<_> = amounts_strs.iter().zip(schedule_times.iter()).map(
+                    |(amount, release_time)| {
+                        Schedule {
+                            release_time: *release_time,
+                            amount: amount.parse::<u64>().unwrap(),
+                        }
+                    }).collect();
+                let pubkey = address.parse::<Pubkey>().unwrap();
+                (pubkey, amounts)
+            }).collect();
+
+            command_create_multiple_svc(
+                rpc_client,
+                program_id,
+                payer_keypair,
+                source_keypair,
+                source_token_pubkey,
+                vestings,
+                mint_address,
             )
         }
         ("unlock", Some(arg_matches)) => {
