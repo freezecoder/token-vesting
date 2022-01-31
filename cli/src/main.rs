@@ -88,13 +88,15 @@ fn command_create_svc(
     let latest_blockhash = rpc_client.get_latest_blockhash().unwrap();
     transaction.sign(&[payer.as_ref()], latest_blockhash);
 
-    rpc_client.send_and_confirm_transaction_with_spinner(&transaction).unwrap();
+    let signature = rpc_client.send_and_confirm_transaction_with_spinner(&transaction).unwrap();
 
     msg!(
-        "\nThe seed of the contract is: {:?}",
-        Pubkey::new_from_array(vesting_seed)
+        "\nThe seed of the contract is: {:?}\
+        \nSignature: {:?}\
+        \nPlease write it down as it is needed to interact with the contract.",
+        Pubkey::new_from_array(vesting_seed),
+        signature
     );
-    msg!("Please write it down as it is needed to interact with the contract.");
 }
 
 // Lock multiple vesting contracts
@@ -183,7 +185,8 @@ fn command_create_multiple_svc(
     let latest_blockhash = rpc_client.get_latest_blockhash().unwrap();
     transaction.sign(&[payer.as_ref()], latest_blockhash);
 
-    rpc_client.send_and_confirm_transaction_with_spinner(&transaction).unwrap();
+    let signature = rpc_client.send_and_confirm_transaction_with_spinner(&transaction).unwrap();
+    msg!("\nSignature: {:?}", signature);
 }
 
 
