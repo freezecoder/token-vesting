@@ -4,6 +4,15 @@ This code has been audited by Kudelski ✅
 
 # Token vesting contract
 
+
+## Building
+
+```{sh}
+
+cd cli && cargo build-bpf
+
+```
+
 ## UI
 
 [Bonfida Token Vesting UI](https://vesting.bonfida.com)
